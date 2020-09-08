@@ -26,8 +26,12 @@ import io.joyrpc.exception.ReflectionException;
 import io.joyrpc.proxy.MethodArgs;
 import io.joyrpc.util.GrpcType.GrpcConversion;
 
+import java.io.File;
+import java.io.IOException;
 import java.lang.reflect.*;
+import java.net.JarURLConnection;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.security.CodeSource;
 import java.security.ProtectionDomain;
 import java.util.*;
@@ -36,6 +40,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 
 /**
  * Title: 类型转换工具类<br>
@@ -79,6 +85,8 @@ public class ClassUtils {
      * 类的元数据
      */
     protected final static Map<Class<?>, ClassMeta> classMetas = new ConcurrentHashMap<>(5000);
+
+    protected static Map<Class, Optional<ThrowableCreation>> throwableCreations = new ConcurrentHashMap<>();
 
     static {
         //这些类型不能用类加载器加载
@@ -799,6 +807,170 @@ public class ClassUtils {
     }
 
     /**
+     * 构建异常信息
+     *
+     * @param exClass    异常类
+     * @param message    错误信息
+     * @param cause      原因
+     * @param stackTrace 堆栈
+     * @return
+     * @throws CreationException
+     */
+    public static Throwable createException(final Class<?> exClass, final String message, final Throwable cause, StackTraceElement[] stackTrace) throws CreationException {
+        Throwable result = null;
+        if (exClass == null) {
+            result = new Exception(message, cause);
+        } else {
+            if (!Throwable.class.isAssignableFrom(exClass)) {
+                throw new CreationException("type not match, not Throwable. " + exClass.getName());
+            }
+            Optional<ThrowableCreation> optional = throwableCreations.computeIfAbsent(exClass, o -> {
+                Constructor<?> constructor0 = null;
+                Constructor<?> constructor1 = null;
+                Constructor<?> constructor2 = null;
+                Constructor<?> constructorNull = null;
+                Class<?>[] types;
+                boolean nullable;
+                //遍历构造函数
+                for (Constructor<?> constructor : o.getConstructors()) {
+                    types = constructor.getParameterTypes();
+                    if (types.length == 0) {
+                        //无参构造函数
+                        constructor0 = constructor;
+                    } else if (types.length == 1 && types[0] == String.class) {
+                        //只带消息参数的构造函数
+                        constructor1 = constructor;
+                    } else if (types.length == 2 && types[0] == String.class && types[1] == Throwable.class) {
+                        //带消息和异常参数的构造函数
+                        constructor2 = constructor;
+                        break;
+                    } else if (constructorNull == null) {
+                        //参数都可以为空的构造函数
+                        nullable = true;
+                        for (Class<?> type : types) {
+                            if (type.isPrimitive()) {
+                                nullable = false;
+                                break;
+                            }
+                        }
+                        if (nullable) {
+                            constructorNull = constructor;
+                        }
+                    }
+                }
+
+                if (constructor2 != null) {
+                    return Optional.of(new ThrowableConstructor2(constructor2));
+                } else if (constructor1 != null) {
+                    return Optional.of(new ThrowableConstructor1(constructor1));
+                } else if (constructor0 != null) {
+                    return Optional.of(new ThrowableConstructor0(constructor0));
+                } else if (constructorNull != null) {
+                    return Optional.of(new ThrowableConstructorNull(constructorNull));
+                }
+
+                return Optional.empty();
+            });
+
+            ThrowableCreation instantiation = optional.get();
+            try {
+
+                result = instantiation == null ? new Exception(message, cause) : instantiation.newInstance(message, cause);
+            } catch (Exception e) {
+                throw new CreationException("create instance error", e);
+            }
+        }
+        if (stackTrace != null) {
+            result.setStackTrace(stackTrace);
+        }
+        return result;
+
+    }
+
+    /**
+     * 从包package中获取所有的Class
+     *
+     * @param pkName 包名
+     * @return
+     */
+    public static Set<Class<?>> scan(final String pkName) throws IOException {
+        Set<Class<?>> classes = new LinkedHashSet<>();
+        boolean recursive = true;
+        String packageName = pkName;
+        String packageDir = packageName.replace('.', '/');
+        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+        Enumeration<URL> dirs = classLoader.getResources(packageDir);
+        while (dirs.hasMoreElements()) {
+            URL url = dirs.nextElement();
+            String protocol = url.getProtocol();
+            if ("file".equals(protocol)) {
+                String filePath = URLDecoder.decode(url.getFile(), "UTF-8");
+                scanByFile(classLoader, packageName, filePath, recursive, classes);
+            } else if ("jar".equals(protocol)) {
+                // 如果是jar包文件
+                JarFile jar = ((JarURLConnection) url.openConnection()).getJarFile();
+                Enumeration<JarEntry> entries = jar.entries();
+                while (entries.hasMoreElements()) {
+                    JarEntry entry = entries.nextElement();
+                    String name = entry.getName();
+                    if (name.charAt(0) == '/') {
+                        // 如果是以/开头的,获取后面的字符串
+                        name = name.substring(1);
+                    }
+                    if (name.startsWith(packageDir)) {
+                        int index = name.lastIndexOf('/');
+                        // 如果以"/"结尾 是一个包
+                        if (index != -1) {
+                            // 获取包名 把"/"替换成"."
+                            packageName = name.substring(0, index).replace('/', '.');
+                        }
+                        if ((index != -1) || recursive) {
+                            if (name.endsWith(".class") && !entry.isDirectory()) {
+                                try {
+                                    classes.add(Class.forName(packageName + '.' + name.substring(packageName.length() + 1, name.length() - 6)));
+                                } catch (ClassNotFoundException e) {
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return classes;
+    }
+
+    /**
+     * 以文件的形式来获取包下的所有Class
+     *
+     * @param classLoader 类加载器
+     * @param packageName 包名
+     * @param packagePath 包路径
+     * @param recursive   递归标识
+     * @param classes     类集合
+     */
+    protected static void scanByFile(ClassLoader classLoader,
+                                     String packageName,
+                                     String packagePath,
+                                     final boolean recursive,
+                                     Set<Class<?>> classes) {
+        File dir = new File(packagePath);
+        if (!dir.exists() || !dir.isDirectory()) {
+            return;
+        }
+        File[] dirFiles = dir.listFiles(file -> (recursive && file.isDirectory()) || (file.getName().endsWith(".class")));
+        for (File file : dirFiles) {
+            if (file.isDirectory()) {
+                scanByFile(classLoader, packageName + "." + file.getName(), file.getAbsolutePath(), recursive, classes);
+            } else {
+                try {
+                    classes.add(classLoader.loadClass(packageName + '.' + file.getName().substring(0, file.getName().length() - 6)));
+                } catch (ClassNotFoundException e) {
+                }
+            }
+        }
+    }
+
+    /**
      * 根据标准名称获取类型
      *
      * @param canonicalNames 标准名称数组
@@ -1066,6 +1238,19 @@ public class ClassUtils {
             getDesc(c, builder);
         }
         return builder.toString();
+    }
+
+    /**
+     * 获取数组类型的最终单元class
+     *
+     * @param clazz
+     * @return
+     */
+    public static Class<?> getComponentType(Class<?> clazz) {
+        while (clazz.isArray()) {
+            clazz = clazz.getComponentType();
+        }
+        return clazz;
     }
 
     /**
@@ -2189,6 +2374,93 @@ public class ClassUtils {
             }
         }
 
+    }
+
+    /**
+     * 实例化接口
+     */
+    @FunctionalInterface
+    protected interface ThrowableCreation {
+
+        /**
+         * 构造
+         *
+         * @return
+         * @throws CreationException
+         */
+        Throwable newInstance(String message, Throwable cause) throws InstantiationException, IllegalAccessException,
+                IllegalArgumentException, InvocationTargetException;
+    }
+
+    /**
+     * 无参数构造函数实
+     */
+    protected static class ThrowableConstructor0 implements ThrowableCreation {
+
+        protected Constructor constructor;
+
+        public ThrowableConstructor0(final Constructor constructor) {
+            this.constructor = constructor;
+            if (!constructor.isAccessible()) {
+                constructor.setAccessible(true);
+            }
+        }
+
+        public Throwable newInstance(final String message, final Throwable cause) throws InstantiationException, IllegalAccessException,
+                IllegalArgumentException, InvocationTargetException {
+            return (Throwable) constructor.newInstance();
+        }
+    }
+
+    /**
+     * 参数为消息的构造函数
+     */
+    protected static class ThrowableConstructor1 extends ThrowableConstructor0 {
+
+        public ThrowableConstructor1(Constructor constructor) {
+            super(constructor);
+        }
+
+        @Override
+        public Throwable newInstance(final String message, final Throwable cause) throws InstantiationException, IllegalAccessException,
+                IllegalArgumentException, InvocationTargetException {
+            return (Throwable) constructor.newInstance(message);
+        }
+    }
+
+    /**
+     * 参数为消息和异常的构造函数
+     */
+    protected static class ThrowableConstructor2 extends ThrowableConstructor0 {
+
+        public ThrowableConstructor2(Constructor constructor) {
+            super(constructor);
+        }
+
+        @Override
+        public Throwable newInstance(final String message, final Throwable cause) throws InstantiationException, IllegalAccessException,
+                IllegalArgumentException, InvocationTargetException {
+            return (Throwable) constructor.newInstance(message, cause);
+        }
+    }
+
+    /**
+     * 参数全部可为空的构造函数
+     */
+    protected static class ThrowableConstructorNull extends ThrowableConstructor0 {
+
+        protected Object[] params;
+
+        public ThrowableConstructorNull(Constructor constructor) {
+            super(constructor);
+            params = new Object[constructor.getParameterCount()];
+        }
+
+        @Override
+        public Throwable newInstance(final String message, final Throwable cause) throws InstantiationException, IllegalAccessException,
+                IllegalArgumentException, InvocationTargetException {
+            return (Throwable) constructor.newInstance(params);
+        }
     }
 
 }
